@@ -1,0 +1,299 @@
+# ---------------------------------------------------------------------------
+# Cooperado: lançamento somente após o encerramento da escala
+# ---------------------------------------------------------------------------
+
+@app.route("/coop/producoes/nova", methods=["GET", "POST"], endpoint="coop_producao_rapida")
+def coop_producao_rapida():
+    denied = _require_role("cooperado")
+    if denied:
+        return denied
+
+    coop = Cooperado.query.filter_by(usuario_id=session.get("user_id")).first_or_404()
+    now = datetime.now(TZ)
+    restaurants = Restaurante.query.order_by(Restaurante.nome.asc()).all()
+
+    if request.method == "POST":
+        scale_id = request.form.get("escala_id", type=int)
+        value = request.form.get("valor", type=float)
+        quantity = request.form.get("qtd_entregas", type=int)
+        description = (request.form.get("descricao") or "").strip() or None
+
+        scale = Escala.query.filter_by(id=scale_id, cooperado_id=coop.id).first()
+        if not scale:
+            flash("Escala inválida.", "danger")
+            return redirect(url_for("coop_producao_rapida"))
+
+        restaurant = _restaurante_for_scale(scale, restaurants)
+        slot_date = _schedule_date(scale, now)
+        times = _times_from_schedule(scale.horario)
+        if not restaurant or not slot_date or not times:
+            flash("Esta escala não possui estabelecimento, data ou horário completos.", "warning")
+            return redirect(url_for("coop_producao_rapida"))
+
+        start, end = times
+        if now < _shift_end_datetime(slot_date, start, end):
+            flash("A produção só pode ser informada depois do término do seu horário.", "warning")
+            return redirect(url_for("coop_producao_rapida"))
+        if slot_date < now.date() - timedelta(days=14):
+            flash("O prazo para informar esta produção expirou.", "warning")
+            return redirect(url_for("coop_producao_rapida"))
+        if value is None or value < 0 or quantity is None or quantity < 0:
+            flash("Informe um valor e uma quantidade válidos.", "warning")
+            return redirect(url_for("coop_producao_rapida"))
+
+        existing_launch = _find_existing_slot(restaurant.id, coop.id, slot_date, start, end)
+        if existing_launch:
+            flash("Esta produção já foi lançada para o mesmo horário.", "info")
+            return redirect(url_for("coop_producao_rapida"))
+
+        existing_pending = ProducaoPendente.query.filter_by(
+            restaurante_id=restaurant.id,
+            cooperado_id=coop.id,
+            data=slot_date,
+            hora_inicio=start,
+            hora_fim=end,
+        ).first()
+        if existing_pending:
+            flash("Esta produção já foi enviada e não será duplicada.", "info")
+            return redirect(url_for("coop_producao_rapida"))
+
+        pending = ProducaoPendente(
+            restaurante_id=restaurant.id,
+            cooperado_id=coop.id,
+            escala_id=scale.id,
+            data=slot_date,
+            hora_inicio=start,
+            hora_fim=end,
+            qtd_entregas=quantity,
+            valor_informado=value,
+            descricao=description,
+            status="pendente",
+        )
+        db.session.add(pending)
+        try:
+            db.session.commit()
+            flash("Produção enviada ao estabelecimento para conferência. A avaliação do contrato é opcional.", "success")
+            return redirect(url_for("coop_avaliar_producao", item_id=pending.id))
+        except IntegrityError:
+            db.session.rollback()
+            flash("Esta produção já foi enviada e não será duplicada.", "info")
+        return redirect(url_for("coop_producao_rapida"))
+
+    scales = (
+        Escala.query.filter(Escala.cooperado_id == coop.id)
+        .order_by(Escala.id.desc())
+        .all()
+    )
+    existing_pending = {
+        (p.escala_id, p.data, p.hora_inicio, p.hora_fim): p
+        for p in ProducaoPendente.query.filter(
+            ProducaoPendente.cooperado_id == coop.id,
+            ProducaoPendente.data >= now.date() - timedelta(days=14),
+        ).all()
+    }
+
+    eligible: list[SimpleNamespace] = []
+    for scale in scales:
+        restaurant = _restaurante_for_scale(scale, restaurants)
+        slot_date = _schedule_date(scale, now)
+        times = _times_from_schedule(scale.horario)
+        if not restaurant or not slot_date or not times:
+            continue
+        start, end = times
+        if slot_date < now.date() - timedelta(days=14) or now < _shift_end_datetime(slot_date, start, end):
+            continue
+        pending = existing_pending.get((scale.id, slot_date, start, end))
+        launch = _find_existing_slot(restaurant.id, coop.id, slot_date, start, end)
+        eligible.append(
+            SimpleNamespace(
+                scale=scale,
+                restaurant=restaurant,
+                data=slot_date,
+                inicio=start,
+                fim=end,
+                pending=pending,
+                launch=launch,
+            )
+        )
+
+    history = (
+        ProducaoPendente.query.filter_by(cooperado_id=coop.id)
+        .order_by(ProducaoPendente.criado_em.desc())
+        .limit(30)
+        .all()
+    )
+    return render_template(
+        "coop_producao_rapida.html",
+        cooperado=coop,
+        escalas=eligible,
+        historico=history,
+    )
+
+
+@app.route("/coop/producoes/<int:item_id>/avaliar", methods=["GET", "POST"], endpoint="coop_avaliar_producao")
+def coop_avaliar_producao(item_id: int):
+    denied = _require_role("cooperado")
+    if denied:
+        return denied
+    coop = Cooperado.query.filter_by(usuario_id=session.get("user_id")).first_or_404()
+    item = ProducaoPendente.query.filter_by(id=item_id, cooperado_id=coop.id).first_or_404()
+    current = AvaliacaoContratoPendente.query.filter_by(producao_pendente_id=item.id).first()
+    if request.method == "POST":
+        def star(name: str) -> int | None:
+            try:
+                value = int(request.form.get(name) or 0)
+                return value if 1 <= value <= 5 else None
+            except (TypeError, ValueError):
+                return None
+        ambiente = star("ambiente")
+        tratamento = star("tratamento")
+        suporte = star("suporte")
+        if not all((ambiente, tratamento, suporte)):
+            flash("Escolha uma nota de 1 a 5 para os três itens.", "warning")
+            return redirect(url_for("coop_avaliar_producao", item_id=item.id))
+        if not current:
+            current = AvaliacaoContratoPendente(
+                producao_pendente_id=item.id,
+                restaurante_id=item.restaurante_id,
+                cooperado_id=coop.id,
+                estrelas_ambiente=ambiente,
+                estrelas_tratamento=tratamento,
+                estrelas_suporte=suporte,
+            )
+            db.session.add(current)
+        else:
+            current.estrelas_ambiente = ambiente
+            current.estrelas_tratamento = tratamento
+            current.estrelas_suporte = suporte
+        current.comentario = (request.form.get("comentario") or "").strip() or None
+        db.session.commit()
+        flash("Avaliação do contrato registrada.", "success")
+        return redirect(url_for("coop_producao_rapida"))
+    return render_template("coop_avaliar_contrato.html", item=item, avaliacao=current)
+
+
+# ---------------------------------------------------------------------------
+# Estabelecimento: conferência, aprovação individual/em lote e alerta
+# ---------------------------------------------------------------------------
+
+@app.get("/rest/producoes/pendentes", endpoint="rest_producoes_pendentes")
+def rest_producoes_pendentes():
+    denied = _require_role("restaurante")
+    if denied:
+        return denied
+    restaurant = Restaurante.query.filter_by(usuario_id=session.get("user_id")).first_or_404()
+    pending = (
+        ProducaoPendente.query.filter_by(restaurante_id=restaurant.id, status="pendente")
+        .order_by(ProducaoPendente.criado_em.asc())
+        .all()
+    )
+    recent = (
+        ProducaoPendente.query.filter(
+            ProducaoPendente.restaurante_id == restaurant.id,
+            ProducaoPendente.status != "pendente",
+        )
+        .order_by(ProducaoPendente.atualizado_em.desc())
+        .limit(50)
+        .all()
+    )
+    return render_template(
+        "rest_producoes_pendentes.html",
+        rest=restaurant,
+        pendentes=pending,
+        recentes=recent,
+    )
+
+
+@app.get("/api/rest/producoes/pendentes/status", endpoint="api_rest_producoes_status")
+def api_rest_producoes_status():
+    if session.get("user_tipo") != "restaurante":
+        return jsonify(ok=False, count=0), 403
+    restaurant = Restaurante.query.filter_by(usuario_id=session.get("user_id")).first()
+    if not restaurant:
+        return jsonify(ok=False, count=0), 403
+    row = (
+        db.session.query(func.count(ProducaoPendente.id), func.max(ProducaoPendente.id))
+        .filter(
+            ProducaoPendente.restaurante_id == restaurant.id,
+            ProducaoPendente.status == "pendente",
+        )
+        .first()
+    )
+    response = jsonify(ok=True, count=int(row[0] or 0), latest_id=int(row[1] or 0))
+    response.headers["Cache-Control"] = "no-store"
+    return response
+
+
+@app.post("/rest/producoes/<int:item_id>/aprovar", endpoint="rest_aprovar_producao")
+def rest_aprovar_producao(item_id: int):
+    denied = _require_role("restaurante")
+    if denied:
+        return denied
+    restaurant = Restaurante.query.filter_by(usuario_id=session.get("user_id")).first_or_404()
+    query = ProducaoPendente.query.filter_by(id=item_id, restaurante_id=restaurant.id)
+    if not legacy._is_sqlite():
+        query = query.with_for_update()
+    item = query.first_or_404()
+    ok, message = _approve_pending(
+        item,
+        valor=request.form.get("valor", type=float),
+        qtd=request.form.get("qtd_entregas", type=int),
+    )
+    if ok:
+        db.session.commit()
+        flash(message, "success")
+    else:
+        db.session.rollback()
+        flash(message, "warning")
+    return redirect(url_for("rest_producoes_pendentes"))
+
+
+@app.post("/rest/producoes/aprovar-todas", endpoint="rest_aprovar_todas_producoes")
+def rest_aprovar_todas_producoes():
+    denied = _require_role("restaurante")
+    if denied:
+        return denied
+    restaurant = Restaurante.query.filter_by(usuario_id=session.get("user_id")).first_or_404()
+    selected = {int(x) for x in request.form.getlist("ids[]") if str(x).isdigit()}
+    query = ProducaoPendente.query.filter_by(restaurante_id=restaurant.id, status="pendente")
+    if selected:
+        query = query.filter(ProducaoPendente.id.in_(selected))
+    items = query.order_by(ProducaoPendente.id.asc()).all()
+    approved = 0
+    errors: list[str] = []
+    for item in items:
+        ok, message = _approve_pending(item)
+        if ok:
+            approved += 1
+        else:
+            errors.append(f"#{item.id}: {message}")
+    try:
+        db.session.commit()
+    except IntegrityError:
+        db.session.rollback()
+        flash("Alguma produção já havia sido lançada. Nada foi duplicado.", "warning")
+        return redirect(url_for("rest_producoes_pendentes"))
+    flash(f"{approved} produção(ões) aprovada(s).", "success")
+    if errors:
+        flash(" | ".join(errors[:5]), "warning")
+    return redirect(url_for("rest_producoes_pendentes"))
+
+
+@app.post("/rest/producoes/<int:item_id>/recusar", endpoint="rest_recusar_producao")
+def rest_recusar_producao(item_id: int):
+    denied = _require_role("restaurante")
+    if denied:
+        return denied
+    restaurant = Restaurante.query.filter_by(usuario_id=session.get("user_id")).first_or_404()
+    item = ProducaoPendente.query.filter_by(id=item_id, restaurante_id=restaurant.id).first_or_404()
+    if item.status != "pendente":
+        flash("Esta produção já foi tratada.", "warning")
+    else:
+        item.status = "recusada"
+        item.motivo_recusa = (request.form.get("motivo") or "").strip() or "Valor ou quantidade precisam de correção."
+        item.decidido_em = datetime.utcnow()
+        db.session.commit()
+        flash("Produção recusada para correção.", "info")
+    return redirect(url_for("rest_producoes_pendentes"))
+
+
