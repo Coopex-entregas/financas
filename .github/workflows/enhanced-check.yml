@@ -86,4 +86,4 @@ jobs:
           print('enhanced app validated')
           PY
       - name: Run complete production workflow
-        run: python tests/smoke_enhanced.py
+        run: PYTHONPATH=. python tests/smoke_enhanced.py
