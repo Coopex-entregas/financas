@@ -40,7 +40,7 @@ jobs:
       - run: pip install -r requirements.txt
       - name: Compile Python sources
         run: |
-          python -m py_compile app.py enhanced_app.py
+          python -m py_compile app.py enhanced_app.py tests/smoke_enhanced.py
           python - <<'PY'
           from pathlib import Path
           for path in sorted(Path('enhanced_parts').glob('*.pyfrag')):
@@ -85,3 +85,5 @@ jobs:
                   app.jinja_env.get_template(template)
           print('enhanced app validated')
           PY
+      - name: Run complete production workflow
+        run: python tests/smoke_enhanced.py
