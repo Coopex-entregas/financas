@@ -1,0 +1,180 @@
+# ---------------------------------------------------------------------------
+# Admin: páginas realmente rápidas, com paginação, filtros e edição AJAX
+# ---------------------------------------------------------------------------
+
+@app.get("/admin/lancamentos-rapidos", endpoint="admin_lancamentos_rapidos")
+def admin_lancamentos_rapidos():
+    denied = _require_role("admin")
+    if denied:
+        return denied
+    page = max(1, request.args.get("page", type=int) or 1)
+    per_page = min(200, max(20, request.args.get("per_page", type=int) or 80))
+    rest_id = request.args.get("restaurante_id", type=int)
+    coop_id = request.args.get("cooperado_id", type=int)
+    start = legacy._parse_date(request.args.get("data_inicio"))
+    end = legacy._parse_date(request.args.get("data_fim"))
+    search = (request.args.get("q") or "").strip()
+
+    query = (
+        db.session.query(Lancamento, Cooperado.nome.label("coop_nome"), Restaurante.nome.label("rest_nome"))
+        .join(Cooperado, Cooperado.id == Lancamento.cooperado_id)
+        .join(Restaurante, Restaurante.id == Lancamento.restaurante_id)
+    )
+    if rest_id:
+        query = query.filter(Lancamento.restaurante_id == rest_id)
+    if coop_id:
+        query = query.filter(Lancamento.cooperado_id == coop_id)
+    if start:
+        query = query.filter(Lancamento.data >= start)
+    if end:
+        query = query.filter(Lancamento.data <= end)
+    if search:
+        pattern = f"%{search}%"
+        query = query.filter(or_(Cooperado.nome.ilike(pattern), Restaurante.nome.ilike(pattern), Lancamento.descricao.ilike(pattern)))
+
+    total = int(query.with_entities(func.count(Lancamento.id)).scalar() or 0)
+    rows = (
+        query.order_by(Lancamento.data.desc(), Lancamento.id.desc())
+        .limit(per_page)
+        .offset((page - 1) * per_page)
+        .all()
+    )
+    pages = max(1, (total + per_page - 1) // per_page)
+    return render_template(
+        "admin_lancamentos_rapidos.html",
+        rows=rows,
+        restaurantes=Restaurante.query.order_by(Restaurante.nome).all(),
+        cooperados=Cooperado.query.order_by(Cooperado.nome).all(),
+        page=page,
+        pages=pages,
+        total=total,
+    )
+
+
+@app.route("/api/admin/lancamentos/<int:item_id>", methods=["PATCH", "DELETE"], endpoint="api_admin_lancamento")
+def api_admin_lancamento(item_id: int):
+    if session.get("user_tipo") != "admin":
+        return jsonify(ok=False, error="Não autorizado"), 403
+    item = Lancamento.query.get_or_404(item_id)
+    if request.method == "DELETE":
+        db.session.execute(legacy.sa_delete(AvaliacaoCooperado).where(AvaliacaoCooperado.lancamento_id == item.id))
+        db.session.execute(legacy.sa_delete(AvaliacaoRestaurante).where(AvaliacaoRestaurante.lancamento_id == item.id))
+        ProducaoPendente.query.filter_by(lancamento_id=item.id).update({"lancamento_id": None}, synchronize_session=False)
+        db.session.delete(item)
+        db.session.commit()
+        _invalidate_admin_cache()
+        return jsonify(ok=True)
+
+    payload = request.get_json(silent=True) or {}
+    data_value = legacy._parse_date(payload.get("data")) or item.data
+    start = _hhmm(payload.get("hora_inicio")) or _hhmm(item.hora_inicio)
+    end = _hhmm(payload.get("hora_fim")) or _hhmm(item.hora_fim)
+    rest_id = int(payload.get("restaurante_id") or item.restaurante_id)
+    coop_id = int(payload.get("cooperado_id") or item.cooperado_id)
+    duplicate = _find_existing_slot(rest_id, coop_id, data_value, start, end, exclude_id=item.id)
+    if duplicate:
+        return jsonify(ok=False, error=f"Conflito com o lançamento #{duplicate.id}."), 409
+    item.restaurante_id = rest_id
+    item.cooperado_id = coop_id
+    item.data = data_value
+    item.hora_inicio = start
+    item.hora_fim = end
+    item.valor = float(payload.get("valor") if payload.get("valor") is not None else item.valor or 0)
+    item.qtd_entregas = int(payload.get("qtd_entregas") if payload.get("qtd_entregas") is not None else item.qtd_entregas or 0)
+    item.descricao = str(payload.get("descricao") if payload.get("descricao") is not None else item.descricao or "").strip() or None
+    db.session.commit()
+    _invalidate_admin_cache()
+    return jsonify(ok=True)
+
+
+@app.get("/admin/escala-rapida", endpoint="admin_escala_rapida")
+def admin_escala_rapida():
+    denied = _require_role("admin")
+    if denied:
+        return denied
+    page = max(1, request.args.get("page", type=int) or 1)
+    per_page = min(250, max(25, request.args.get("per_page", type=int) or 100))
+    rest_id = request.args.get("restaurante_id", type=int)
+    coop_id = request.args.get("cooperado_id", type=int)
+    search = (request.args.get("q") or "").strip()
+
+    query = Escala.query
+    if rest_id:
+        query = query.filter(Escala.restaurante_id == rest_id)
+    if coop_id:
+        query = query.filter(Escala.cooperado_id == coop_id)
+    if search:
+        pattern = f"%{search}%"
+        query = query.filter(or_(Escala.data.ilike(pattern), Escala.turno.ilike(pattern), Escala.horario.ilike(pattern), Escala.contrato.ilike(pattern), Escala.cooperado_nome.ilike(pattern)))
+
+    total = int(query.with_entities(func.count(Escala.id)).scalar() or 0)
+    rows = query.order_by(Escala.id.desc()).limit(per_page).offset((page - 1) * per_page).all()
+    pages = max(1, (total + per_page - 1) // per_page)
+    coop_map = {c.id: c for c in Cooperado.query.order_by(Cooperado.nome).all()}
+    rest_map = {r.id: r for r in Restaurante.query.order_by(Restaurante.nome).all()}
+    return render_template(
+        "admin_escala_rapida.html",
+        rows=rows,
+        cooperados=list(coop_map.values()),
+        restaurantes=list(rest_map.values()),
+        coop_map=coop_map,
+        rest_map=rest_map,
+        page=page,
+        pages=pages,
+        total=total,
+    )
+
+
+@app.route("/api/admin/escalas/<int:item_id>", methods=["PATCH", "DELETE"], endpoint="api_admin_escala")
+def api_admin_escala(item_id: int):
+    if session.get("user_tipo") != "admin":
+        return jsonify(ok=False, error="Não autorizado"), 403
+    item = Escala.query.get_or_404(item_id)
+    if request.method == "DELETE":
+        db.session.execute(legacy.sa_delete(TrocaSolicitacao).where(TrocaSolicitacao.origem_escala_id == item.id))
+        db.session.delete(item)
+        db.session.commit()
+        _invalidate_admin_cache()
+        return jsonify(ok=True)
+
+    payload = request.get_json(silent=True) or {}
+    item.cooperado_id = int(payload["cooperado_id"]) if str(payload.get("cooperado_id") or "").isdigit() else None
+    item.restaurante_id = int(payload["restaurante_id"]) if str(payload.get("restaurante_id") or "").isdigit() else None
+    item.data = str(payload.get("data") or "").strip()
+    item.turno = str(payload.get("turno") or "").strip()
+    item.horario = str(payload.get("horario") or "").strip()
+    item.contrato = str(payload.get("contrato") or "").strip()
+    item.cooperado_nome = str(payload.get("cooperado_nome") or "").strip() or None
+    db.session.commit()
+    _invalidate_admin_cache()
+    return jsonify(ok=True)
+
+
+@app.delete("/api/admin/escalas", endpoint="api_admin_escalas_bulk_delete")
+def api_admin_escalas_bulk_delete():
+    if session.get("user_tipo") != "admin":
+        return jsonify(ok=False, error="Não autorizado"), 403
+    payload = request.get_json(silent=True) or {}
+    ids = {int(x) for x in payload.get("ids", []) if str(x).isdigit()}
+    if not ids:
+        return jsonify(ok=False, error="Nenhuma escala selecionada"), 400
+    db.session.execute(legacy.sa_delete(TrocaSolicitacao).where(TrocaSolicitacao.origem_escala_id.in_(ids)))
+    result = db.session.execute(legacy.sa_delete(Escala).where(Escala.id.in_(ids)))
+    db.session.commit()
+    _invalidate_admin_cache()
+    return jsonify(ok=True, deleted=int(result.rowcount or 0))
+
+
+@app.get("/admin/producoes/pendentes", endpoint="admin_producoes_pendentes")
+def admin_producoes_pendentes():
+    denied = _require_role("admin")
+    if denied:
+        return denied
+    status = (request.args.get("status") or "pendente").strip().lower()
+    query = ProducaoPendente.query
+    if status != "todos":
+        query = query.filter(ProducaoPendente.status == status)
+    rows = query.order_by(ProducaoPendente.criado_em.desc()).limit(300).all()
+    return render_template("admin_producoes_pendentes.html", rows=rows, status=status)
+
+
