@@ -1,0 +1,45 @@
+<!doctype html>
+<html lang="pt-BR">
+<head>
+  <meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>Informar produção — COOPEX</title>
+  <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.2/dist/css/bootstrap.min.css">
+  <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/bootstrap-icons@1.11.3/font/bootstrap-icons.css">
+  <style>
+    body{background:#f5f7ff;color:#101828}.top{background:linear-gradient(110deg,#1736b5,#2747d9);color:#fff}.wrap{max-width:920px}.card{border:0;border-radius:18px;box-shadow:0 8px 28px #17255412}.slot{border-left:6px solid #2747d9}.money{font-variant-numeric:tabular-nums}.badge-pendente{background:#fff3cd;color:#7a5200}.badge-aprovada{background:#dcfce7;color:#166534}.badge-recusada{background:#fee2e2;color:#991b1b}
+  </style>
+</head>
+<body>
+<header class="top py-3"><div class="container wrap d-flex align-items-center gap-3"><a class="btn btn-light btn-sm" href="{{ url_for('portal_cooperado') }}"><i class="bi bi-arrow-left"></i></a><div><strong>Informar produção</strong><div class="small opacity-75">Disponível somente após o fim do seu horário</div></div></div></header>
+<main class="container wrap py-4">
+  {% with messages=get_flashed_messages(with_categories=true) %}{% for cat,msg in messages %}<div class="alert alert-{{ cat }}">{{ msg }}</div>{% endfor %}{% endwith %}
+  <div class="alert alert-info"><i class="bi bi-shield-check"></i> O estabelecimento confere o valor e a quantidade antes de a produção entrar no financeiro. O mesmo horário não pode ser lançado duas vezes.</div>
+  <h5 class="mb-3">Horários encerrados</h5>
+  {% if escalas %}
+    <div class="row g-3">
+    {% for item in escalas %}
+      <div class="col-12"><div class="card slot"><div class="card-body">
+        <div class="d-flex flex-wrap justify-content-between gap-2 mb-3">
+          <div><strong>{{ item.restaurant.nome }}</strong><div class="text-secondary">{{ item.data.strftime('%d/%m/%Y') }} · {{ item.inicio }}–{{ item.fim }} · {{ item.scale.turno or 'Turno' }}</div></div>
+          {% if item.launch %}<span class="badge text-bg-success align-self-start">Já lançado</span>{% elif item.pending %}<span class="badge badge-{{ item.pending.status }} align-self-start">{{ item.pending.status|capitalize }}</span>{% endif %}
+        </div>
+        {% if not item.launch and not item.pending %}
+        <form method="post" class="row g-2 align-items-end">
+          <input type="hidden" name="escala_id" value="{{ item.scale.id }}">
+          <div class="col-sm-3"><label class="form-label">Quantidade de entregas</label><input class="form-control" name="qtd_entregas" type="number" min="0" inputmode="numeric" required></div>
+          <div class="col-sm-3"><label class="form-label">Valor produzido</label><div class="input-group"><span class="input-group-text">R$</span><input class="form-control money" name="valor" type="number" min="0" step="0.01" inputmode="decimal" required></div></div>
+          <div class="col-sm-4"><label class="form-label">Observação opcional</label><input class="form-control" name="descricao" maxlength="300" placeholder="Ex.: valor conforme relatório"></div>
+          <div class="col-sm-2 d-grid"><button class="btn btn-primary"><i class="bi bi-send-check"></i> Enviar</button></div>
+        </form>
+        {% elif item.pending %}<div class="small text-secondary">Enviado em {{ item.pending.criado_em.strftime('%d/%m/%Y %H:%M') if item.pending.criado_em else '' }}. Valor informado: R$ {{ '%.2f'|format(item.pending.valor_informado or 0)|replace('.', ',') }}.</div>{% endif %}
+      </div></div></div>
+    {% endfor %}
+    </div>
+  {% else %}<div class="card"><div class="card-body text-center py-5 text-secondary"><i class="bi bi-clock-history fs-1"></i><p class="mb-0 mt-2">Nenhum horário encerrado disponível nos últimos 14 dias.</p></div></div>{% endif %}
+
+  <h5 class="mt-4 mb-3">Histórico recente</h5>
+  <div class="card"><div class="table-responsive"><table class="table align-middle mb-0"><thead><tr><th>Data</th><th>Estabelecimento</th><th>Horário</th><th>Entregas</th><th>Valor</th><th>Status</th></tr></thead><tbody>
+  {% for p in historico %}<tr><td>{{ p.data.strftime('%d/%m/%Y') }}</td><td>{{ p.restaurante.nome if p.restaurante else '—' }}</td><td>{{ p.hora_inicio }}–{{ p.hora_fim }}</td><td>{{ p.qtd_entregas }}</td><td>R$ {{ '%.2f'|format(p.valor_aprovado if p.valor_aprovado is not none else p.valor_informado)|replace('.', ',') }}</td><td><span class="badge badge-{{ p.status }}">{{ p.status|capitalize }}</span>{% if p.motivo_recusa %}<div class="small text-danger">{{ p.motivo_recusa }}</div>{% endif %}</td></tr>{% else %}<tr><td colspan="6" class="text-center text-secondary py-4">Sem registros.</td></tr>{% endfor %}
+  </tbody></table></div></div>
+</main>
+</body></html>

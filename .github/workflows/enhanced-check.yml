@@ -1,0 +1,89 @@
+name: Enhanced app check
+
+on:
+  push:
+    branches:
+      - feature/producao-rapida-performance-admin
+  pull_request:
+
+jobs:
+  validate:
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: postgres
+          POSTGRES_DB: coopex_test
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U postgres"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+    env:
+      DATABASE_URL: postgresql://postgres:postgres@127.0.0.1:5432/coopex_test?sslmode=disable
+      SECRET_KEY: test-secret
+      FLASK_ENV: development
+      FLASK_SECURE_COOKIES: "0"
+      INIT_DB_ON_START: "0"
+      ADMIN_USER: admin_test
+      ADMIN_PASS: admin_test_123
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+      - run: pip install -r requirements.txt
+      - name: Compile Python sources
+        run: |
+          python -m py_compile app.py enhanced_app.py tests/smoke_enhanced.py
+          python - <<'PY'
+          from pathlib import Path
+          for path in sorted(Path('enhanced_parts').glob('*.pyfrag')):
+              compile(path.read_text(encoding='utf-8'), str(path), 'exec')
+              print('compiled', path)
+          PY
+      - name: Import app and validate routes
+        run: |
+          python - <<'PY'
+          import enhanced_app
+          from sqlalchemy import inspect
+
+          app = enhanced_app.app
+          required = {
+              'coop_producao_rapida',
+              'coop_avaliar_producao',
+              'rest_producoes_pendentes',
+              'rest_aprovar_producao',
+              'rest_aprovar_todas_producoes',
+              'api_rest_producoes_status',
+              'admin_lancamentos_rapidos',
+              'admin_escala_rapida',
+              'api_admin_lancamento',
+              'api_admin_escala',
+              'enhanced_health',
+          }
+          missing = required - set(app.view_functions)
+          assert not missing, f'Rotas ausentes: {sorted(missing)}'
+
+          with app.app_context():
+              tables = set(inspect(enhanced_app.db.engine).get_table_names())
+              assert 'producoes_pendentes' in tables
+              assert 'avaliacoes_contrato_pendentes' in tables
+              for template in (
+                  'coop_producao_rapida.html',
+                  'coop_avaliar_contrato.html',
+                  'rest_producoes_pendentes.html',
+                  'admin_lancamentos_rapidos.html',
+                  'admin_escala_rapida.html',
+                  'admin_producoes_pendentes.html',
+              ):
+                  app.jinja_env.get_template(template)
+          print('enhanced app validated')
+          PY
+      - name: Run complete production workflow
+        run: PYTHONPATH=. python tests/smoke_enhanced.py

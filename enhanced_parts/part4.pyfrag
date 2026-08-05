@@ -1,0 +1,225 @@
+# ---------------------------------------------------------------------------
+# Proteção para o lançamento legado do estabelecimento
+# ---------------------------------------------------------------------------
+
+_original_rest_launch = app.view_functions.get("lancar_producao")
+if _original_rest_launch:
+    def _protected_rest_launch(*args, **kwargs):
+        if request.method == "POST" and session.get("user_tipo") == "restaurante":
+            restaurant = Restaurante.query.filter_by(usuario_id=session.get("user_id")).first()
+            coop_id = request.form.get("cooperado_id", type=int)
+            slot_date = legacy._parse_date(request.form.get("data")) or date.today()
+            start = _hhmm(request.form.get("hora_inicio"))
+            end = _hhmm(request.form.get("hora_fim"))
+            if restaurant and coop_id and start and end:
+                existing = _find_existing_slot(restaurant.id, coop_id, slot_date, start, end)
+                if existing:
+                    flash(f"Este horário já possui o lançamento #{existing.id}. Nenhuma duplicidade foi criada.", "info")
+                    return redirect(url_for("portal_restaurante", view="lancamentos"))
+                pending = ProducaoPendente.query.filter_by(
+                    restaurante_id=restaurant.id,
+                    cooperado_id=coop_id,
+                    data=slot_date,
+                    hora_inicio=start,
+                    hora_fim=end,
+                    status="pendente",
+                ).first()
+                if pending:
+                    ok, message = _approve_pending(
+                        pending,
+                        valor=request.form.get("valor", type=float),
+                        qtd=request.form.get("qtd_entregas", type=int),
+                    )
+                    if ok:
+                        db.session.commit()
+                        flash("A produção enviada pelo cooperado foi confirmada, sem criar outra.", "success")
+                        return redirect(url_for("portal_restaurante", view="lancamentos"))
+                    db.session.rollback()
+                    flash(message, "warning")
+                    return redirect(url_for("portal_restaurante", view="lancar"))
+        return _original_rest_launch(*args, **kwargs)
+
+    _protected_rest_launch.__name__ = "lancar_producao"
+    app.view_functions["lancar_producao"] = _protected_rest_launch
+
+
+# ---------------------------------------------------------------------------
+# Portal do estabelecimento sem N+1: uma consulta de lançamentos por período
+# e escala carregada somente quando a aba de escala for aberta.
+# ---------------------------------------------------------------------------
+
+
+def _parse_month(value: str | None) -> tuple[date | None, date | None]:
+    match = re.fullmatch(r"(\d{4})-(\d{2})", str(value or "").strip())
+    if not match:
+        return None, None
+    year, month = map(int, match.groups())
+    try:
+        start = date(year, month, 1)
+        end = (date(year + 1, 1, 1) if month == 12 else date(year, month + 1, 1)) - timedelta(days=1)
+        return start, end
+    except ValueError:
+        return None, None
+
+
+def _portal_restaurante_fast():
+    denied = _require_role("restaurante")
+    if denied:
+        return denied
+    restaurant = Restaurante.query.filter_by(usuario_id=session.get("user_id")).first()
+    if not restaurant:
+        return "<p style='font-family:Arial;margin:40px'>Seu usuário não está vinculado a um estabelecimento. Avise o administrador.</p>"
+
+    view = (request.args.get("view") or "lancar").strip().lower()
+    start = legacy._parse_date(request.args.get("data_inicio"))
+    end = legacy._parse_date(request.args.get("data_fim"))
+    month = (request.args.get("mes") or "").strip()
+    period_description = None
+    if month:
+        month_start, month_end = _parse_month(month)
+        if month_start and month_end:
+            start, end = month_start, month_end
+            period_description = "mês"
+    if not start or not end:
+        start_weekday = {"seg-dom": 0, "sab-sex": 5, "sex-qui": 4}.get(restaurant.periodo, 0)
+        today = date.today()
+        start = start or (today - timedelta(days=(today.weekday() - start_weekday) % 7))
+        end = end or (start + timedelta(days=6))
+        period_description = period_description or restaurant.periodo
+    else:
+        period_description = period_description or "personalizado"
+
+    cooperators = Cooperado.query.order_by(Cooperado.nome).all()
+    launches = (
+        Lancamento.query.filter(
+            Lancamento.restaurante_id == restaurant.id,
+            Lancamento.data >= start,
+            Lancamento.data <= end,
+        )
+        .order_by(Lancamento.data.desc(), Lancamento.id.desc())
+        .all()
+    )
+    grouped: dict[int, list[Lancamento]] = defaultdict(list)
+    for launch in launches:
+        grouped[launch.cooperado_id].append(launch)
+    for cooperator in cooperators:
+        cooperator.lancamentos = grouped.get(cooperator.id, [])
+        cooperator.total_periodo = sum(float(x.valor or 0) for x in cooperator.lancamentos)
+
+    total_gross = sum(float(x.valor or 0) for x in launches)
+    total_count = len(launches)
+    total_deliveries = sum(int(x.qtd_entregas or 0) for x in launches)
+    total_inss = total_gross * 0.045
+
+    reference = legacy._parse_date(request.args.get("ref")) or date.today()
+    mode = request.args.get("modo", "semana")
+    days: list[date] = []
+    agenda: dict[date, list] = {}
+    if view == "escalas":
+        days = [reference] if mode == "dia" else [reference - timedelta(days=reference.weekday()) + timedelta(days=i) for i in range(7)]
+        agenda = {day: [] for day in days}
+        scales = Escala.query.filter(Escala.restaurante_id == restaurant.id).order_by(Escala.id.asc()).all()
+        if not scales:
+            scales = Escala.query.filter(Escala.contrato.ilike(f"%{restaurant.nome}%")).order_by(Escala.id.asc()).all()
+        coop_ids = {x.cooperado_id for x in scales if x.cooperado_id}
+        scale_coops = {x.id: x for x in Cooperado.query.filter(Cooperado.id.in_(coop_ids)).all()} if coop_ids else {}
+        seen = {day: set() for day in days}
+        for scale in scales:
+            parsed_date = legacy._parse_data_escala_str(scale.data)
+            weekday = legacy._weekday_from_data_str(scale.data)
+            for day in days:
+                if not ((parsed_date and parsed_date == day) or (weekday and weekday == day.weekday() + 1)):
+                    continue
+                cooperator = scale_coops.get(scale.cooperado_id)
+                display_name = (cooperator.nome if cooperator else (scale.cooperado_nome or "—"))
+                key = (scale.cooperado_id or display_name, legacy._norm(scale.turno), legacy._norm(scale.horario))
+                if key in seen[day]:
+                    break
+                seen[day].add(key)
+                agenda[day].append({
+                    "coop": cooperator,
+                    "cooperado_nome": scale.cooperado_nome,
+                    "nome_planilha": display_name,
+                    "turno": (scale.turno or "").strip(),
+                    "horario": (scale.horario or "").strip(),
+                    "contrato": (scale.contrato or restaurant.nome).strip(),
+                    "cor": (scale.cor or "").strip(),
+                })
+                break
+        for day in days:
+            agenda[day].sort(key=lambda x: (x["contrato"].lower(), x["nome_planilha"].lower()))
+
+    launch_items = []
+    if view == "lancamentos":
+        coop_names = {x.id: x.nome for x in cooperators}
+        launch_items = [
+            {
+                "id": item.id,
+                "data": item.data.strftime("%d/%m/%Y") if item.data else "",
+                "hora_inicio": _hhmm(item.hora_inicio),
+                "hora_fim": _hhmm(item.hora_fim),
+                "qtd_entregas": item.qtd_entregas or 0,
+                "valor": float(item.valor or 0),
+                "descricao": item.descricao or "",
+                "cooperado_id": item.cooperado_id,
+                "cooperado_nome": coop_names.get(item.cooperado_id, ""),
+                "contrato_nome": restaurant.nome,
+            }
+            for item in sorted(launches, key=lambda x: (x.data or date.min, x.id))
+        ]
+
+    pending_count = int(ProducaoPendente.query.filter_by(restaurante_id=restaurant.id, status="pendente").count())
+    return render_template(
+        "restaurante_dashboard.html",
+        rest=restaurant,
+        cooperados=cooperators,
+        filtro_inicio=start,
+        filtro_fim=end,
+        filtro_mes=month,
+        periodo_desc=period_description,
+        total_bruto=total_gross,
+        total_inss=total_inss,
+        total_liquido=total_gross - total_inss,
+        total_qtd=total_count,
+        total_entregas=total_deliveries,
+        view=view,
+        agenda=agenda,
+        dias_list=days,
+        ref_data=reference,
+        modo=mode,
+        lancamentos_periodo=launch_items,
+        total_lanc_valor=total_gross if view == "lancamentos" else 0,
+        total_lanc_entregas=total_deliveries if view == "lancamentos" else 0,
+        url_lancar_producao=url_for("lancar_producao"),
+        has_editar_lanc=("editar_lancamento" in app.view_functions),
+        producoes_pendentes_count=pending_count,
+    )
+
+
+app.view_functions["portal_restaurante"] = _portal_restaurante_fast
+
+
+_original_coop_portal = app.view_functions.get("portal_cooperado")
+if _original_coop_portal:
+    def _portal_cooperado_prefetched(*args, **kwargs):
+        if session.get("user_tipo") == "cooperado":
+            coop = Cooperado.query.filter_by(usuario_id=session.get("user_id")).first()
+            if coop:
+                exchanges = TrocaSolicitacao.query.filter(
+                    or_(TrocaSolicitacao.destino_id == coop.id, TrocaSolicitacao.solicitante_id == coop.id)
+                ).all()
+                coop_ids = {coop.id}
+                scale_ids = set()
+                for exchange in exchanges:
+                    coop_ids.update((exchange.destino_id, exchange.solicitante_id))
+                    scale_ids.add(exchange.origem_escala_id)
+                if coop_ids:
+                    Cooperado.query.filter(Cooperado.id.in_(coop_ids)).all()
+                if scale_ids:
+                    Escala.query.filter(Escala.id.in_(scale_ids)).all()
+        return _original_coop_portal(*args, **kwargs)
+
+    _portal_cooperado_prefetched.__name__ = "portal_cooperado"
+    app.view_functions["portal_cooperado"] = _portal_cooperado_prefetched
+
+

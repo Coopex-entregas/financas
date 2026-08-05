@@ -1,0 +1,176 @@
+# ---------------------------------------------------------------------------
+# Cache curto para o HTML pesado do admin + invalidação em qualquer alteração
+# ---------------------------------------------------------------------------
+
+_admin_cache: dict[tuple, tuple[float, bytes, list[tuple[str, str]], int]] = {}
+_admin_cache_lock = threading.RLock()
+_admin_cache_version = 0
+_original_admin_dashboard = app.view_functions.get("admin_dashboard")
+
+
+def _invalidate_admin_cache() -> None:
+    global _admin_cache_version
+    with _admin_cache_lock:
+        _admin_cache_version += 1
+        _admin_cache.clear()
+
+
+@app.before_request
+def _invalidate_cache_on_write():
+    if request.method not in {"GET", "HEAD", "OPTIONS"}:
+        _invalidate_admin_cache()
+    elif any(token in request.path.lower() for token in ("/delete", "/excluir", "/purge")):
+        _invalidate_admin_cache()
+
+
+if _original_admin_dashboard:
+    def _cached_admin_dashboard(*args, **kwargs):
+        if request.method != "GET" or session.get("user_tipo") != "admin":
+            return _original_admin_dashboard(*args, **kwargs)
+        key = (
+            session.get("user_id"),
+            request.query_string,
+            _admin_cache_version,
+        )
+        now = time.monotonic()
+        with _admin_cache_lock:
+            cached = _admin_cache.get(key)
+            if cached and now - cached[0] <= 12:
+                response = Response(cached[1], status=cached[3])
+                for name, value in cached[2]:
+                    response.headers[name] = value
+                response.headers["X-COOPEX-Cache"] = "HIT"
+                return response
+        response = make_response(_original_admin_dashboard(*args, **kwargs))
+        if response.status_code == 200 and response.mimetype == "text/html" and "Set-Cookie" not in response.headers:
+            headers = [(k, v) for k, v in response.headers.items() if k.lower() not in {"content-length", "content-encoding"}]
+            with _admin_cache_lock:
+                _admin_cache[key] = (now, response.get_data(), headers, response.status_code)
+        response.headers["X-COOPEX-Cache"] = "MISS"
+        return response
+
+    _cached_admin_dashboard.__name__ = "admin_dashboard"
+    app.view_functions["admin_dashboard"] = _cached_admin_dashboard
+
+
+# ---------------------------------------------------------------------------
+# Menu superior estilo banco, atalhos e compactação das respostas
+# ---------------------------------------------------------------------------
+
+_ADMIN_NAV = """
+<div id="coopexBankNav" class="coopex-bank-nav">
+  <div class="coopex-bank-main">
+    <a class="coopex-bank-brand" href="/admin?tab=resumo">COOPEX <small>Admin</small></a>
+    <span>Visão geral</span><span>Financeiro</span><span>Cadastros</span><span>Operação</span><span>Arquivos</span>
+    <a class="coopex-exit" href="/logout">Sair</a>
+  </div>
+  <div class="coopex-bank-sub">
+    <a href="/admin?tab=resumo">Resumo</a>
+    <a href="/admin/lancamentos-rapidos">Lançamentos rápidos</a>
+    <a href="/admin?tab=receitas">Receitas</a>
+    <a href="/admin?tab=despesas">Despesas</a>
+    <a href="/admin?tab=beneficios">Benefícios</a>
+    <a href="/admin?tab=cooperados">Cooperados</a>
+    <a href="/admin?tab=restaurantes">Estabelecimentos</a>
+    <a href="/admin/escala-rapida">Escala rápida</a>
+    <a href="/admin/producoes/pendentes">Produções pendentes</a>
+    <a href="/admin/avaliacoes">Avaliações</a>
+    <a href="/admin/avisos">Avisos</a>
+    <a href="/admin/documentos">Documentos</a>
+    <a href="/admin/tabelas">Tabelas</a>
+    <a href="/admin?tab=config">Configurações</a>
+  </div>
+</div>
+"""
+
+_INJECT_STYLE = """
+<style id="coopexFastStyle">
+.coopex-bank-nav{position:fixed;z-index:4000;inset:0 0 auto 0;background:#fff;box-shadow:0 5px 24px #0f172a1a;font-family:system-ui,-apple-system,Segoe UI,sans-serif}
+.coopex-bank-main,.coopex-bank-sub{display:flex;align-items:center;gap:10px;overflow-x:auto;white-space:nowrap;padding:9px 18px;scrollbar-width:thin}
+.coopex-bank-main{background:linear-gradient(100deg,#1736b5,#2747d9);color:#fff;font-weight:700}
+.coopex-bank-main>span{padding:7px 10px;border-radius:10px;background:#ffffff12}
+.coopex-bank-brand,.coopex-exit{color:#fff!important;text-decoration:none;font-weight:900}.coopex-bank-brand small{font-weight:500;opacity:.8}.coopex-exit{margin-left:auto}
+.coopex-bank-sub{padding-top:7px;padding-bottom:7px}.coopex-bank-sub a{color:#172554;text-decoration:none;font-weight:700;padding:7px 10px;border-radius:10px}.coopex-bank-sub a:hover{background:#eef2ff;color:#2747d9}
+body.coopex-admin-fast{padding-top:104px!important}.coopex-admin-fast .sidebar{display:none!important}.coopex-admin-fast .main{margin-left:0!important;padding:16px!important}.coopex-admin-fast .layout{display:block!important}
+.coopex-production-fab{position:fixed;right:18px;bottom:18px;z-index:3500;background:#2747d9;color:#fff!important;text-decoration:none;padding:13px 17px;border-radius:999px;font-weight:800;box-shadow:0 10px 28px #2747d966}
+.coopex-pending-link{position:fixed;right:18px;bottom:18px;z-index:3500;background:#dc2626;color:#fff!important;text-decoration:none;padding:13px 17px;border-radius:999px;font-weight:800;box-shadow:0 10px 28px #dc262655}
+.coopex-fast-toast{position:fixed;z-index:5000;right:18px;top:120px;padding:12px 16px;border-radius:12px;background:#111827;color:#fff;box-shadow:0 12px 30px #0004;display:none}
+@media(max-width:700px){body.coopex-admin-fast{padding-top:111px!important}.coopex-bank-main,.coopex-bank-sub{padding-left:10px;padding-right:10px}.coopex-bank-main>span{display:none}}
+</style>
+"""
+
+_FAST_SCRIPT = """
+<script id="coopexFastScript">
+(function(){
+  const path=location.pathname;
+  if(path.startsWith('/admin')) document.body.classList.add('coopex-admin-fast');
+  document.querySelectorAll('form[method="get"],form[method="GET"]').forEach(form=>{
+    let timer;
+    form.querySelectorAll('select,input[type="date"],input[type="month"]').forEach(el=>{
+      el.addEventListener('change',()=>{clearTimeout(timer);timer=setTimeout(()=>form.requestSubmit(),180)});
+    });
+  });
+  const toast=document.createElement('div');toast.className='coopex-fast-toast';document.body.appendChild(toast);
+  window.coopexToast=(msg)=>{toast.textContent=msg;toast.style.display='block';setTimeout(()=>toast.style.display='none',1800)};
+})();
+</script>
+"""
+
+
+def _inject_enhancements(html: str) -> str:
+    endpoint = request.endpoint or ""
+    path = request.path
+    additions = _INJECT_STYLE + _FAST_SCRIPT
+    if path.startswith("/admin"):
+        html = html.replace("<body", "<body class=\"coopex-admin-fast\"", 1) if "<body" in html and "coopex-admin-fast" not in html else html
+        html = html.replace("<body class=\"coopex-admin-fast\">", "<body class=\"coopex-admin-fast\">" + _ADMIN_NAV, 1)
+        if _ADMIN_NAV not in html and "<body" in html:
+            end = html.find(">", html.find("<body"))
+            html = html[: end + 1] + _ADMIN_NAV + html[end + 1 :]
+    elif endpoint == "portal_cooperado" or path in {"/portal/cooperado", "/painel/cooperado"}:
+        additions += '<a class="coopex-production-fab" href="/coop/producoes/nova">Informar produção</a>'
+    elif endpoint == "portal_restaurante" or path == "/portal/restaurante":
+        additions += '<a id="coopexPendingLink" class="coopex-pending-link" href="/rest/producoes/pendentes">Produções pendentes <b id="coopexPendingCount"></b></a>'
+        additions += """<script>(function(){const n=document.getElementById('coopexPendingCount');fetch('/api/rest/producoes/pendentes/status',{cache:'no-store'}).then(r=>r.json()).then(x=>{if(n)n.textContent=x.count?'('+x.count+')':''}).catch(()=>{});})();</script>"""
+    return html.replace("</body>", additions + "</body>", 1) if "</body>" in html else html + additions
+
+
+@app.after_request
+def _fast_response(response):
+    try:
+        if response.status_code == 200 and response.mimetype == "text/html" and not response.is_streamed:
+            html = response.get_data(as_text=True)
+            response.set_data(_inject_enhancements(html))
+        if request.path.startswith("/static/"):
+            response.headers["Cache-Control"] = "public, max-age=604800, immutable"
+        elif response.mimetype in {"text/html", "application/json"}:
+            response.headers.setdefault("Cache-Control", "no-cache")
+
+        accepts = request.headers.get("Accept-Encoding", "")
+        content_type = response.content_type or ""
+        compressible = any(x in content_type for x in ("text/", "json", "javascript", "xml"))
+        if (
+            "gzip" in accepts.lower()
+            and compressible
+            and not response.is_streamed
+            and not response.headers.get("Content-Encoding")
+            and 200 <= response.status_code < 300
+        ):
+            data = response.get_data()
+            if len(data) >= 1200:
+                compressed = gzip.compress(data, compresslevel=5)
+                if len(compressed) < len(data):
+                    response.set_data(compressed)
+                    response.headers["Content-Encoding"] = "gzip"
+                    response.headers["Content-Length"] = str(len(compressed))
+                    response.headers["Vary"] = "Accept-Encoding"
+        if not response.headers.get("ETag") and not response.is_streamed and response.status_code == 200:
+            response.set_etag(hashlib.sha1(response.get_data()).hexdigest())
+    except Exception:
+        app.logger.exception("Falha na otimização da resposta")
+    return response
+
+
+@app.get("/healthz/enhanced", endpoint="enhanced_health")
+def enhanced_health():
+    return jsonify(ok=True, layer="enhanced", pending_table=True)

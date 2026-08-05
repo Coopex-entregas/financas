@@ -1,0 +1,337 @@
+from __future__ import annotations
+
+"""Camada de desempenho e produção confirmada para o sistema COOPEX.
+
+Este módulo importa o aplicativo legado sem remover rotas ou modelos. As melhorias
+são registradas por cima do app existente e o deploy passa a apontar para
+``enhanced_app:app``. Assim, a reversão consiste apenas em voltar o entrypoint.
+"""
+
+import gzip
+import hashlib
+import re
+import threading
+import time
+from collections import defaultdict
+from datetime import date, datetime, timedelta
+from types import SimpleNamespace
+from urllib.parse import urlencode
+from zoneinfo import ZoneInfo
+
+import app as legacy
+from flask import (
+    Response,
+    abort,
+    flash,
+    jsonify,
+    make_response,
+    redirect,
+    render_template,
+    request,
+    session,
+    url_for,
+)
+from sqlalchemy import and_, func, or_, text as sa_text
+from sqlalchemy.exc import IntegrityError
+
+app = legacy.app
+db = legacy.db
+
+Usuario = legacy.Usuario
+Cooperado = legacy.Cooperado
+Restaurante = legacy.Restaurante
+Lancamento = legacy.Lancamento
+Escala = legacy.Escala
+TrocaSolicitacao = legacy.TrocaSolicitacao
+AvaliacaoCooperado = legacy.AvaliacaoCooperado
+AvaliacaoRestaurante = legacy.AvaliacaoRestaurante
+
+TZ = ZoneInfo("America/Fortaleza")
+
+
+class ProducaoPendente(db.Model):
+    """Produção informada por cooperado e aguardando conferência."""
+
+    __tablename__ = "producoes_pendentes"
+
+    id = db.Column(db.Integer, primary_key=True)
+    restaurante_id = db.Column(
+        db.Integer, db.ForeignKey("restaurantes.id", ondelete="CASCADE"), nullable=False, index=True
+    )
+    cooperado_id = db.Column(
+        db.Integer, db.ForeignKey("cooperados.id", ondelete="CASCADE"), nullable=False, index=True
+    )
+    escala_id = db.Column(
+        db.Integer, db.ForeignKey("escalas.id", ondelete="SET NULL"), nullable=True, index=True
+    )
+    lancamento_id = db.Column(
+        db.Integer, db.ForeignKey("lancamentos.id", ondelete="SET NULL"), nullable=True, index=True
+    )
+    data = db.Column(db.Date, nullable=False, index=True)
+    hora_inicio = db.Column(db.String(5), nullable=False)
+    hora_fim = db.Column(db.String(5), nullable=False)
+    qtd_entregas = db.Column(db.Integer, nullable=False, default=0)
+    valor_informado = db.Column(db.Float, nullable=False, default=0.0)
+    valor_aprovado = db.Column(db.Float)
+    descricao = db.Column(db.String(300))
+    status = db.Column(db.String(20), nullable=False, default="pendente", index=True)
+    origem = db.Column(db.String(20), nullable=False, default="cooperado")
+    motivo_recusa = db.Column(db.String(300))
+    criado_em = db.Column(db.DateTime, nullable=False, default=datetime.utcnow, index=True)
+    atualizado_em = db.Column(
+        db.DateTime, nullable=False, default=datetime.utcnow, onupdate=datetime.utcnow
+    )
+    decidido_em = db.Column(db.DateTime)
+
+    restaurante = db.relationship("Restaurante")
+    cooperado = db.relationship("Cooperado")
+    escala = db.relationship("Escala")
+    lancamento = db.relationship("Lancamento")
+
+    __table_args__ = (
+        db.UniqueConstraint(
+            "restaurante_id",
+            "cooperado_id",
+            "data",
+            "hora_inicio",
+            "hora_fim",
+            name="uq_producao_pendente_slot",
+        ),
+    )
+
+
+class AvaliacaoContratoPendente(db.Model):
+    """Avaliação opcional feita logo após o cooperado informar a produção."""
+
+    __tablename__ = "avaliacoes_contrato_pendentes"
+
+    id = db.Column(db.Integer, primary_key=True)
+    producao_pendente_id = db.Column(
+        db.Integer,
+        db.ForeignKey("producoes_pendentes.id", ondelete="CASCADE"),
+        nullable=False,
+        unique=True,
+        index=True,
+    )
+    restaurante_id = db.Column(db.Integer, db.ForeignKey("restaurantes.id", ondelete="CASCADE"), nullable=False)
+    cooperado_id = db.Column(db.Integer, db.ForeignKey("cooperados.id", ondelete="CASCADE"), nullable=False)
+    estrelas_ambiente = db.Column(db.Integer, nullable=False)
+    estrelas_tratamento = db.Column(db.Integer, nullable=False)
+    estrelas_suporte = db.Column(db.Integer, nullable=False)
+    comentario = db.Column(db.Text)
+    criado_em = db.Column(db.DateTime, nullable=False, default=datetime.utcnow)
+
+    producao = db.relationship("ProducaoPendente", backref=db.backref("avaliacao_opcional", uselist=False, cascade="all, delete-orphan"))
+
+
+# ---------------------------------------------------------------------------
+# Banco: criação idempotente e índices de leitura
+# ---------------------------------------------------------------------------
+
+def _install_database_objects() -> None:
+    with app.app_context():
+        db.create_all()
+        schema = "" if legacy._is_sqlite() else "public."
+        statements = [
+            f"CREATE INDEX IF NOT EXISTS ix_lanc_rest_data ON {schema}lancamentos (restaurante_id, data)",
+            f"CREATE INDEX IF NOT EXISTS ix_lanc_coop_data ON {schema}lancamentos (cooperado_id, data)",
+            f"CREATE INDEX IF NOT EXISTS ix_lanc_slot ON {schema}lancamentos (restaurante_id, cooperado_id, data, hora_inicio, hora_fim)",
+            f"CREATE INDEX IF NOT EXISTS ix_escala_coop ON {schema}escalas (cooperado_id)",
+            f"CREATE INDEX IF NOT EXISTS ix_escala_rest ON {schema}escalas (restaurante_id)",
+            f"CREATE INDEX IF NOT EXISTS ix_trocas_dest_status ON {schema}trocas (destino_id, status)",
+            f"CREATE INDEX IF NOT EXISTS ix_trocas_solic_status ON {schema}trocas (solicitante_id, status)",
+            f"CREATE INDEX IF NOT EXISTS ix_prodpend_rest_status ON {schema}producoes_pendentes (restaurante_id, status, criado_em)",
+            f"CREATE INDEX IF NOT EXISTS ix_prodpend_coop_data ON {schema}producoes_pendentes (cooperado_id, data)",
+        ]
+        try:
+            for statement in statements:
+                db.session.execute(sa_text(statement))
+            db.session.commit()
+        except Exception:
+            db.session.rollback()
+            app.logger.exception("Falha ao criar índices da camada rápida")
+
+
+_install_database_objects()
+
+
+# ---------------------------------------------------------------------------
+# Utilitários de horário, duplicidade e autenticação
+# ---------------------------------------------------------------------------
+
+def _require_role(role: str):
+    if session.get("user_tipo") != role:
+        return redirect(url_for("login"))
+    return None
+
+
+def _hhmm(value: str | None) -> str:
+    value = str(value or "").strip()
+    match = re.search(r"(?<!\d)([01]?\d|2[0-3])(?::([0-5]\d))?\s*h?(?!\d)", value)
+    if not match:
+        return ""
+    return f"{int(match.group(1)):02d}:{int(match.group(2) or 0):02d}"
+
+
+def _times_from_schedule(value: str | None) -> tuple[str, str] | None:
+    matches = re.findall(r"(?<!\d)([01]?\d|2[0-3])(?::([0-5]\d))?\s*h?(?!\d)", str(value or ""))
+    if len(matches) < 2:
+        return None
+    first, last = matches[0], matches[-1]
+    return (
+        f"{int(first[0]):02d}:{int(first[1] or 0):02d}",
+        f"{int(last[0]):02d}:{int(last[1] or 0):02d}",
+    )
+
+
+def _minutes(value: str | None) -> int | None:
+    normalized = _hhmm(value)
+    if not normalized:
+        return None
+    hour, minute = map(int, normalized.split(":"))
+    return hour * 60 + minute
+
+
+def _interval_overlap(a_start: str, a_end: str, b_start: str, b_end: str) -> bool:
+    a0, a1 = _minutes(a_start), _minutes(a_end)
+    b0, b1 = _minutes(b_start), _minutes(b_end)
+    if None in (a0, a1, b0, b1):
+        return _hhmm(a_start) == _hhmm(b_start) and _hhmm(a_end) == _hhmm(b_end)
+    if a1 <= a0:
+        a1 += 24 * 60
+    if b1 <= b0:
+        b1 += 24 * 60
+    return max(a0, b0) < min(a1, b1)
+
+
+def _slot_query(restaurante_id: int, cooperado_id: int, data_slot: date):
+    return Lancamento.query.filter(
+        Lancamento.restaurante_id == restaurante_id,
+        Lancamento.cooperado_id == cooperado_id,
+        Lancamento.data == data_slot,
+    )
+
+
+def _find_existing_slot(
+    restaurante_id: int,
+    cooperado_id: int,
+    data_slot: date,
+    hora_inicio: str,
+    hora_fim: str,
+    *,
+    exclude_id: int | None = None,
+) -> Lancamento | None:
+    query = _slot_query(restaurante_id, cooperado_id, data_slot)
+    if exclude_id:
+        query = query.filter(Lancamento.id != exclude_id)
+    for item in query.all():
+        if _interval_overlap(hora_inicio, hora_fim, item.hora_inicio or "", item.hora_fim or ""):
+            return item
+    return None
+
+
+def _schedule_date(scale: Escala, now: datetime) -> date | None:
+    explicit = legacy._parse_data_escala_str(scale.data)
+    if explicit:
+        return explicit
+    weekday = legacy._weekday_from_data_str(scale.data)
+    if not weekday:
+        return None
+    monday = now.date() - timedelta(days=now.date().weekday())
+    candidate = monday + timedelta(days=weekday - 1)
+    return candidate
+
+
+def _shift_end_datetime(scale_date: date, start: str, end: str) -> datetime:
+    sh, sm = map(int, start.split(":"))
+    eh, em = map(int, end.split(":"))
+    start_dt = datetime(scale_date.year, scale_date.month, scale_date.day, sh, sm, tzinfo=TZ)
+    end_dt = datetime(scale_date.year, scale_date.month, scale_date.day, eh, em, tzinfo=TZ)
+    if end_dt <= start_dt:
+        end_dt += timedelta(days=1)
+    return end_dt
+
+
+def _restaurante_for_scale(scale: Escala, restaurants: list[Restaurante]) -> Restaurante | None:
+    if scale.restaurante_id:
+        return next((r for r in restaurants if r.id == scale.restaurante_id), None)
+    target = " ".join(legacy._normalize_name(scale.contrato or ""))
+    if not target:
+        return None
+    for restaurant in restaurants:
+        normalized = " ".join(legacy._normalize_name(restaurant.nome or ""))
+        if target == normalized or target in normalized or normalized in target:
+            return restaurant
+    return None
+
+
+def _approve_pending(item: ProducaoPendente, *, valor: float | None = None, qtd: int | None = None) -> tuple[bool, str]:
+    if item.status != "pendente":
+        return False, "Esta produção já foi tratada."
+
+    final_value = float(item.valor_informado if valor is None else valor)
+    final_qtd = int(item.qtd_entregas if qtd is None else qtd)
+    if final_value < 0 or final_qtd < 0:
+        return False, "Valor ou quantidade inválidos."
+
+    existing = _find_existing_slot(
+        item.restaurante_id,
+        item.cooperado_id,
+        item.data,
+        item.hora_inicio,
+        item.hora_fim,
+    )
+    if existing:
+        exact = (
+            _hhmm(existing.hora_inicio) == item.hora_inicio
+            and _hhmm(existing.hora_fim) == item.hora_fim
+        )
+        if not exact:
+            return False, "Existe outro lançamento sobrepondo este horário. Corrija o horário antes de aprovar."
+        item.lancamento_id = existing.id
+        item.valor_aprovado = float(existing.valor or final_value)
+    else:
+        launch = Lancamento(
+            restaurante_id=item.restaurante_id,
+            cooperado_id=item.cooperado_id,
+            descricao=(item.descricao or "Produção informada pelo cooperado"),
+            valor=final_value,
+            data=item.data,
+            hora_inicio=item.hora_inicio,
+            hora_fim=item.hora_fim,
+            qtd_entregas=final_qtd,
+        )
+        db.session.add(launch)
+        db.session.flush()
+        item.lancamento_id = launch.id
+        item.valor_aprovado = final_value
+
+    optional_rating = AvaliacaoContratoPendente.query.filter_by(producao_pendente_id=item.id).first()
+    if optional_rating and item.lancamento_id:
+        existing_rating = AvaliacaoRestaurante.query.filter_by(
+            lancamento_id=item.lancamento_id, cooperado_id=item.cooperado_id
+        ).first()
+        if not existing_rating:
+            average = round((optional_rating.estrelas_ambiente + optional_rating.estrelas_tratamento + optional_rating.estrelas_suporte) / 3.0, 2)
+            db.session.add(AvaliacaoRestaurante(
+                restaurante_id=item.restaurante_id,
+                cooperado_id=item.cooperado_id,
+                lancamento_id=item.lancamento_id,
+                estrelas_ambiente=optional_rating.estrelas_ambiente,
+                estrelas_tratamento=optional_rating.estrelas_tratamento,
+                estrelas_suporte=optional_rating.estrelas_suporte,
+                estrelas_geral=round(average, 1),
+                media_ponderada=average,
+                comentario=optional_rating.comentario,
+                sentimento=legacy._analise_sentimento(optional_rating.comentario),
+                temas="; ".join(legacy._identifica_temas(optional_rating.comentario)),
+                alerta_crise=False,
+            ))
+
+    item.status = "aprovada"
+    item.qtd_entregas = final_qtd
+    item.decidido_em = datetime.utcnow()
+    item.atualizado_em = datetime.utcnow()
+    return True, "Produção aprovada."
+
+
